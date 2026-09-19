@@ -1,0 +1,625 @@
+"""
+Foundry-mini — Streamlit showcase app (LangChain / LangGraph edition).
+
+Same product as foundry-mini-app-12 — the Foundry Security Spec's pipeline,
+raw LLM vs. harness, compared side by side — rebuilt on real LangChain
+chains orchestrated by a LangGraph StateGraph, with Splunk Agent
+Observability wired through LangChain's own SplunkAOCallback instead of
+manual spans. Runs with Anthropic, OpenAI, or fully offline.
+
+Run locally:   streamlit run streamlit_app.py
+Deploy:        push to GitHub, point Streamlit Community Cloud at this file.
+"""
+
+import streamlit as st
+
+from foundry_mini.llm import Budget, ModelError, DEFAULTS, build_chat_model
+from foundry_mini.pipeline import stream_harness, finalize
+from foundry_mini.sample import SAMPLE_TARGET, build_markdown_report
+from foundry_mini.github_fetch import fetch_sources
+from foundry_mini.baseline import run_baseline
+from foundry_mini.ciso_report import build_raw_ciso_report, build_harness_ciso_report
+from foundry_mini.rule_authoring import draft_rule_from_gap, push_rule
+from foundry_mini.remediator import suggest_patches
+from foundry_mini.observability import (build_sao_tracer,
+                                        DEFAULT_PROJECT as SAO_DEFAULT_PROJECT,
+                                        DEFAULT_AGENT_STREAM as SAO_DEFAULT_AGENT_STREAM)
+
+st.set_page_config(page_title="Foundry-mini — Agentic Security Scanner (LangChain)",
+                   page_icon="🛡️", layout="wide")
+
+# ---------------------------------------------------------------- styling ----
+st.markdown("""
+<style>
+  .block-container { padding-top: 2rem; max-width: 1150px; }
+  .hero { font-size: 2.1rem; font-weight: 700; margin-bottom: .1rem; }
+  .sub  { color: #6b7280; font-size: 1.02rem; margin-bottom: 1rem; }
+  .pill { display:inline-block; padding:2px 10px; border-radius:999px;
+          font-size:.72rem; font-weight:600; margin-right:6px; }
+  .sev-critical { background:#fee2e2; color:#991b1b; }
+  .sev-high     { background:#ffedd5; color:#9a3412; }
+  .sev-medium   { background:#fef9c3; color:#854d0e; }
+  .sev-low      { background:#e0e7ff; color:#3730a3; }
+  .leg { font-family:ui-monospace,monospace; font-size:.82rem; color:#374151; }
+  .gate-ok  { color:#166534; font-weight:600; }
+  .gate-bad { color:#b91c1c; font-weight:600; }
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown('<div class="hero">🛡️ Foundry-mini <span style="font-size:1rem;'
+           'font-weight:600;color:#6b7280;">· LangChain / LangGraph edition</span></div>',
+           unsafe_allow_html=True)
+st.markdown('<div class="sub">The same Cisco Foundry Security Spec pipeline as '
+           'foundry-mini-app-12, rebuilt on real LangChain chains orchestrated by '
+           'a LangGraph StateGraph, compared side by side against a raw one-shot '
+           'prompt. Works with Anthropic, OpenAI, or fully offline.</div>',
+           unsafe_allow_html=True)
+
+with st.expander("What is this, and how does it work?  (read me first)", expanded=False):
+    st.markdown("""
+Same pipeline as the raw-SDK build, on a different stack. Your code goes through:
+
+1. **Indexer** — a deterministic parser (Python `ast`) builds a function
+   inventory + call graph. Never LLM-only, by design (FR-020).
+2. **Cartographer** — a LangGraph node whose chain maps entry points, trust
+   boundaries, and sensitive data flows by reasoning about what each function
+   actually does, with a cheap deterministic heuristic scan underneath as a
+   floor so the map is never empty.
+3. **Detector** — sweeps every function against the loaded **CodeGuard rules**
+   in one real chain call per function, scans for secrets deterministically,
+   and runs an **exploratory agent** that hunts for what no rule describes.
+4. **Triager** — a real chain call per candidate investigates it against the
+   actual source (plus its callers/callees) and proposes cited evidence. The
+   **evidence gate** — plain Python, not the model — then mechanically checks
+   that the required legs (reachability, trust-boundary, impact) are present
+   and every citation actually resolves to a real line. The model proposes;
+   the gate decides.
+5. **Validator** — no live testbed, so `exploited` always stays `false`; the
+   model sketches a plausible proof-of-concept narrative instead of a claim.
+6. **Reporter** — severity, title, and business impact — a fast table for
+   common CWEs, a real classification chain for anything else.
+
+All six roles are nodes in one compiled LangGraph `StateGraph`, invoked once
+per run via `.stream()` — which is also what makes the whole run show up as
+**one SAO trace with a named span per role**, when tracing is on, instead of
+one trace per role the way the raw-SDK build has to do it.
+    """)
+
+# ------------------------------------------------------------- sidebar setup -
+with st.sidebar:
+    st.header("Setup")
+
+    st.markdown("**Step 1 — Choose how to run**")
+    run_mode = st.radio(
+        "Provider",
+        ["Offline demo (no key needed)", "Anthropic (Claude)", "OpenAI (GPT)"],
+        label_visibility="collapsed",
+    )
+
+    provider = "mock"
+    api_key = None
+    model_name = None
+
+    if run_mode == "Anthropic (Claude)":
+        provider = "anthropic"
+        st.markdown("**Step 2 — Paste your Anthropic API key**")
+        api_key = st.text_input("Anthropic API key", type="password",
+                                label_visibility="collapsed",
+                                placeholder="sk-ant-...")
+        model_name = st.text_input("Model", value=DEFAULTS["anthropic"],
+                                   help="Editable — change if this model name is not "
+                                        "available on your account.")
+    elif run_mode == "OpenAI (GPT)":
+        provider = "openai"
+        st.markdown("**Step 2 — Paste your OpenAI API key**")
+        api_key = st.text_input("OpenAI API key", type="password",
+                                label_visibility="collapsed",
+                                placeholder="sk-...")
+        model_name = st.text_input("Model", value=DEFAULTS["openai"],
+                                   help="Editable — e.g. gpt-4o, gpt-4o-mini.")
+    else:
+        st.caption("Offline mode uses a deterministic engine that reproduces the "
+                   "model's judgments generically (pattern-driven, not hardcoded "
+                   "to the built-in sample). No key, no network, no LangChain "
+                   "model constructed.")
+
+    st.markdown("**Step 3 — Set a budget cap (USD)**")
+    budget_cap = st.number_input("Budget cap", min_value=0.0, value=5.0, step=1.0,
+                                 label_visibility="collapsed",
+                                 help="Every role below now makes real chain calls, so "
+                                      "a run costs more than a single prompt would. "
+                                      "The run halts as soon as either side crosses "
+                                      "this cap (FR-112).")
+
+    st.divider()
+    with st.expander("Observability — Splunk Agent Observability (optional)"):
+        st.caption("All three fields are optional. Leave the key blank and nothing "
+                   "SAO-related is imported or contacted. Never used in Offline "
+                   "demo mode.")
+        sao_api_key = st.text_input("SAO API key", type="password",
+                                    placeholder="leave blank to disable tracing")
+        sao_project = st.text_input("SAO project name", value=SAO_DEFAULT_PROJECT,
+                                    help="Get-or-created by name.")
+        sao_agent_stream = st.text_input(
+            "SAO Agent Stream name", value=SAO_DEFAULT_AGENT_STREAM,
+            help="Also get-or-created by name.")
+
+    st.divider()
+    st.caption("Rules: CodeGuard (CC-BY-4.0). Spec: Cisco Foundry Security Spec. "
+               "This is a prototype, not the production system.")
+
+# --------------------------------------------------------------- input pane --
+st.markdown("### Step 4 — Give it something to scan")
+tab_sample, tab_paste, tab_github = st.tabs(
+    ["🧪 Use the sample app", "📝 Paste your code", "🔗 GitHub link"])
+
+sources = None
+with tab_sample:
+    st.caption("A deliberately vulnerable Python service with four planted bugs. "
+               "The fastest way to see the full pipeline fire.")
+    with st.expander("Preview the sample code"):
+        st.code(SAMPLE_TARGET, language="python")
+    if st.button("Load sample", type="secondary"):
+        st.session_state["sources"] = {"app.py": SAMPLE_TARGET}
+        st.session_state["source_label"] = "built-in sample (app.py)"
+
+with tab_paste:
+    pasted = st.text_area("Paste Python code", height=240,
+                          placeholder="# paste one or more Python functions here")
+    fname = st.text_input("File name", value="pasted.py")
+    if st.button("Use pasted code", type="secondary"):
+        if pasted.strip():
+            st.session_state["sources"] = {fname: pasted}
+            st.session_state["source_label"] = f"pasted code ({fname})"
+        else:
+            st.warning("Paste some code first.")
+
+with tab_github:
+    st.caption("A single Python file URL, or a whole repo URL "
+               "(github.com/owner/repo — Python files only, capped for demo).")
+    gh_url = st.text_input("GitHub URL",
+                           placeholder="https://github.com/owner/repo  or  .../blob/main/app.py")
+    if st.button("Fetch from GitHub", type="secondary"):
+        if gh_url.strip():
+            try:
+                with st.spinner("Fetching…"):
+                    fetched = fetch_sources(gh_url)
+                st.session_state["sources"] = fetched
+                st.session_state["source_label"] = f"{gh_url} ({len(fetched)} file(s))"
+                st.success(f"Fetched {len(fetched)} Python file(s).")
+            except Exception as e:
+                st.error(f"Could not fetch: {e}")
+        else:
+            st.warning("Enter a GitHub URL first.")
+
+sources = st.session_state.get("sources")
+if sources:
+    st.info(f"Ready to scan: **{st.session_state.get('source_label','loaded source')}** "
+            f"— {sum(len(s.splitlines()) for s in sources.values())} lines across "
+            f"{len(sources)} file(s).")
+
+# ------------------------------------------------------------------- run -----
+st.markdown("### Step 5 — Run the comparison")
+st.caption("Every run scans the same input two ways and puts the results side by "
+           "side: a raw one-shot prompt, and the full evidence-gated harness.")
+
+run = st.button("▶  Run: raw LLM vs. Foundry harness", type="primary",
+                disabled=sources is None)
+
+
+def _build_llm():
+    if provider in ("anthropic", "openai") and not api_key:
+        st.error(f"Enter your {provider} API key in the sidebar, or switch to "
+                 f"Offline demo mode.")
+        st.stop()
+    budget = Budget(budget_cap if budget_cap > 0 else None)
+    try:
+        return build_chat_model(provider, api_key, model_name), budget
+    except ModelError as e:
+        st.error(str(e))
+        st.stop()
+
+
+_STAGE_ORDER = ["indexer", "cartographer", "detector", "triager", "validator", "reporter"]
+_STAGE_LABELS = {
+    "indexer": "Indexer — building deterministic index (AST)…",
+    "cartographer": "Cartographer — mapping attack surface (LLM pass + heuristic floor)…",
+    "detector": "Detector — CodeGuard rule sweep + secret scan + exploratory hunt…",
+    "triager": "Triager — LLM investigates each candidate; the gate decides…",
+    "validator": "Validator — no testbed; the model sketches a PoC narrative…",
+    "reporter": "Reporter — severity/title/business-impact classification…",
+}
+
+
+def _stage_line(stage_name, summary):
+    if stage_name == "indexer":
+        return f"→ {summary['functions']} functions indexed, call graph built. Index gate released (FR-003)."
+    if stage_name == "cartographer":
+        aug = "live LLM pass" if summary["llm_augmented"] else "heuristic only (no live model)"
+        return (f"→ {summary['entry_points']} entry points, {summary['trust_boundaries']} "
+               f"trust boundaries, {summary['data_flows']} sensitive data flows. ({aug})")
+    if stage_name == "detector":
+        return (f"→ {summary['total_candidates']} total candidate(s) across "
+               f"{summary['rules']} rules. {summary['rule_gaps']} rule gap(s) recorded.")
+    if stage_name == "triager":
+        return f"→ {summary['true_positives']} true-positive, {summary['demoted']} demoted to needs-review by the gate."
+    if stage_name == "validator":
+        return f"→ {summary['poc_sketches']} PoC sketch(es) produced. exploited stays false (no testbed)."
+    if stage_name == "reporter":
+        return f"→ {summary['classified']} confirmed finding(s) classified."
+    return ""
+
+
+def _run_pipeline(llm, budget, tracer):
+    mode_label = ("Offline (deterministic)" if provider == "mock"
+                  else f"{provider} · {model_name or DEFAULTS.get(provider,'')}")
+    st.caption(f"Mode: **{mode_label}**  |  Budget cap: {budget.usd_cap}")
+
+    gen = stream_harness(sources, llm, budget, tracer)
+    final_state = None
+    for expected_stage in _STAGE_ORDER:
+        label = _STAGE_LABELS[expected_stage]
+        with st.status(label, expanded=False) as status:
+            try:
+                stage_name, summary, state = next(gen)
+            except StopIteration:
+                status.update(label=f"{label} — did not run", state="error")
+                st.error("The pipeline stopped early — see any error above.")
+                st.stop()
+            except ModelError as e:
+                status.update(label=f"{label} — model error", state="error")
+                st.error(f"{e}\n\nTip: check the model name, or switch to Offline "
+                         f"demo mode to run without a provider.")
+                st.stop()
+            except Exception as e:
+                status.update(label=f"{label} — failed", state="error")
+                st.error(str(e))
+                st.stop()
+            status.update(label=label, state="complete")
+        st.write(_stage_line(stage_name, summary))
+        final_state = state
+        if budget.exceeded():
+            st.warning(f"Budget cap reached during {stage_name} — halting (FR-112).")
+            gen.close()
+            break
+
+    return finalize(final_state, budget)
+
+
+def _run_raw(llm, budget, tracer):
+    with st.status("Raw LLM — one prompt over the whole codebase…", expanded=False) as s:
+        try:
+            findings = run_baseline(sources, llm, budget, tracer)
+        except ModelError as e:
+            s.update(label="Raw LLM — model error", state="error")
+            st.error(f"{e}\n\nTip: check the model name, or switch to Offline mode.")
+            st.stop()
+        s.update(label="Raw LLM — done (no verification applied)", state="complete")
+    return findings
+
+
+def _refresh_sao_status(tracer):
+    st.session_state["sao_activated"] = tracer.activated
+    st.session_state["sao_urls"] = tracer.console_urls()
+    st.session_state["sao_warnings"] = tracer.sdk_warnings
+    st.session_state["sao_session_id"] = tracer.session_id
+    st.session_state["sao_pending_before_flush"] = tracer.pending_before_flush
+
+
+def _record_history():
+    import datetime
+    b = st.session_state.get("baseline")
+    r = st.session_state.get("result")
+    snap = {
+        "time": datetime.datetime.now().strftime("%H:%M:%S"),
+        "source": st.session_state.get("source_label", "source"),
+        "raw": None, "harness": None,
+    }
+    if b is not None:
+        snap["raw"] = {
+            "reported": len(b),
+            "unverifiable": sum(1 for f in b if not f.get("_symbol_exists", True)),
+        }
+    if r is not None:
+        snap["harness"] = {
+            "tps": len(r.true_positives), "demoted": len(r.demotions),
+            "gaps": len(r.rule_gaps), "coverage": r.coverage["complete"],
+            "spend": r.budget["usd_spent"],
+        }
+    hist = st.session_state.get("history", [])
+    hist.insert(0, snap)
+    st.session_state["history"] = hist[:2]
+
+
+if run and sources:
+    for k in ("result", "result_md", "baseline", "drafted_rules", "patches",
+             "pushed_rules", "sao_urls", "sao_requested", "sao_activated",
+             "sao_warnings", "sao_session_id", "sao_pending_before_flush"):
+        st.session_state.pop(k, None)
+
+    old_tracer = st.session_state.pop("sao_tracer", None)
+    if old_tracer is not None:
+        old_tracer.detach()
+
+    tracer = None
+    if provider != "mock" and sao_api_key:
+        st.session_state["sao_requested"] = True
+        tracer = build_sao_tracer(sao_api_key, sao_project, sao_agent_stream)
+        st.session_state["sao_tracer"] = tracer
+
+    st.markdown("#### Running the raw LLM baseline")
+    llm_a, budget_a = _build_llm()
+    st.session_state["baseline"] = _run_raw(llm_a, budget_a, tracer)
+
+    st.markdown("#### Running the Foundry pipeline")
+    llm_b, budget_b = _build_llm()
+    st.session_state["result"] = _run_pipeline(llm_b, budget_b, tracer)
+    st.session_state["result_md"] = build_markdown_report(st.session_state["result"])
+
+    if tracer is not None:
+        tracer.flush()
+        _refresh_sao_status(tracer)
+
+    _record_history()
+
+# ============================ RESULTS (fragment) ============================
+
+def _render_comparison_table(baseline, result):
+    st.markdown("## Raw LLM vs. Foundry harness")
+    raw_unverifiable = sum(1 for f in baseline if not f.get("_symbol_exists", True))
+    rows = [
+        {"Metric": "Findings reported / confirmed",
+         "Raw LLM": str(len(baseline)), "Foundry harness": str(len(result.true_positives))},
+        {"Metric": "Unverifiable / demoted",
+         "Raw LLM": f"{raw_unverifiable} (never checked)",
+         "Foundry harness": f"{len(result.demotions)} (checked & withheld)"},
+        {"Metric": "Evidence backing",
+         "Raw LLM": "none", "Foundry harness": "3-leg citations, mechanically resolved"},
+        {"Metric": "Dedup identity",
+         "Raw LLM": "none", "Foundry harness": "fingerprint (stable under edit)"},
+        {"Metric": "Coverage claim",
+         "Raw LLM": "none", "Foundry harness": str(result.coverage["complete"])},
+        {"Metric": "New classes beyond the ruleset",
+         "Raw LLM": "n/a", "Foundry harness": f"{len(result.rule_gaps)} rule gap(s)"},
+        {"Metric": "Cost / calls",
+         "Raw LLM": "1 call (unmetered)",
+         "Foundry harness": f"${result.budget['usd_spent']} / {result.budget['calls']} calls "
+                            f"(cap {result.budget['usd_cap']})"},
+    ]
+    st.table(rows)
+
+    raw_symbols = {(f.get("symbol"), f.get("vuln_class")) for f in baseline}
+    tp_symbols = {(f.symbol, f.vuln_class) for f in result.true_positives}
+    only_pipeline = sorted(tp_symbols - raw_symbols)
+    only_raw = sorted(raw_symbols - tp_symbols)
+    if only_pipeline:
+        st.markdown("**Found only by the harness**: " +
+                    ", ".join(f"`{s}` ({c})" for s, c in only_pipeline))
+    if only_raw:
+        st.markdown("**Claimed only by the raw LLM, not confirmed**: " +
+                    ", ".join(f"`{s}` ({c})" for s, c in only_raw))
+    if not only_pipeline and not only_raw:
+        st.caption("Both found the same set on this input — but only the harness "
+                   "can show cited, resolved evidence for each one.")
+
+    d1, d2 = st.columns(2)
+    d1.download_button("⬇  Raw LLM CISO report (advisory)",
+                       data=build_raw_ciso_report(baseline),
+                       file_name="ciso-report-no-harness.md", mime="text/markdown",
+                       key="dl_raw_ciso")
+    d2.download_button("⬇  Harness CISO report (authoritative)",
+                       data=build_harness_ciso_report(result),
+                       file_name="ciso-report-harnessed.md", mime="text/markdown",
+                       key="dl_harness_ciso")
+
+
+def _render_raw_detail(baseline):
+    with st.expander("Raw LLM findings, as reported (unverified)"):
+        for f in baseline:
+            exists = f.get("_symbol_exists", True)
+            sev = (f.get("severity") or "medium").lower()
+            sev = sev if sev in ("critical", "high", "medium", "low") else "medium"
+            flag = "" if exists else "  ⚠️ unverifiable location"
+            with st.container(border=True):
+                st.markdown(f'<span class="pill sev-{sev}">{sev.upper()}</span> '
+                            f'<b>{f.get("vuln_class","?")}</b> — '
+                            f'<code>{f.get("symbol","?")}()</code>{flag}',
+                            unsafe_allow_html=True)
+                st.markdown(f"{f.get('why','')}")
+
+
+def _render_harness_detail(result):
+    with st.expander("Confirmed findings — evidence, PoC sketch, patches", expanded=True):
+        for f in result.true_positives:
+            sev = f.severity
+            with st.container(border=True):
+                st.markdown(f'<span class="pill sev-{sev}">{sev.upper()}</span> '
+                            f'<b>{f.title or f.vuln_class}</b> — '
+                            f'<code>{f.symbol}()</code> · {f.weakness}',
+                            unsafe_allow_html=True)
+                st.markdown(f"**Location:** `{f.file}` → `{f.symbol}()`  \n"
+                            f"**Fingerprint:** `{f.fingerprint()}`  \n"
+                            f"**Technique:** {f.technique}")
+                st.markdown(f"**Investigation:** {f.investigation}")
+                for c in f.citations:
+                    st.markdown(f'<span class="leg">• <b>{c.leg}</b> — '
+                                f'{c.file}:{c.line} — {c.note}</span>',
+                                unsafe_allow_html=True)
+                st.markdown(f"**PoC sketch:** {f.poc}")
+                st.markdown(f"**Exploited:** `{f.exploited}` (no testbed)")
+
+        if result.demotions:
+            st.markdown("#### Demoted to needs-review")
+            for symbol, cls, why in result.demotions:
+                st.markdown(f'<span class="gate-bad">✗</span> `{symbol}` ({cls}) — {why}',
+                            unsafe_allow_html=True)
+
+        with st.expander("Coverage & budget detail"):
+            cov = result.coverage
+            st.markdown(f"**Coverage-complete:** `{cov['complete']}`")
+            for item, meta in cov["items"].items():
+                mark = "✅" if meta["attempted"] else "⬜"
+                st.markdown(f"{mark} {item} — *{', '.join(meta['techniques']) or '—'}*")
+            b = result.budget
+            st.markdown(f"**Budget:** {b['calls']} model calls, ${b['usd_spent']} spent "
+                        f"(cap {b['usd_cap']}).")
+
+        st.download_button("⬇  Full pipeline report (Markdown)",
+                           data=st.session_state.get("result_md", ""),
+                           file_name="foundry-mini-report.md", mime="text/markdown",
+                           key="dl_full")
+
+
+def _render_flywheel(result):
+    if not result.rule_gaps:
+        return
+    st.divider()
+    st.markdown("### New discoveries → author & push detection rules")
+    for i, g in enumerate(result.rule_gaps):
+        st.markdown(f"**Discovery {i+1}: {g['vuln_class']}** in `{g['finding']}` — {g['pattern']}")
+    if st.button("Draft CodeGuard rules from these discoveries", key="draft_rules"):
+        tracer = st.session_state.get("sao_tracer")
+        llm, budget = _build_llm()
+        st.session_state["drafted_rules"] = [
+            draft_rule_from_gap(g, llm, budget, tracer) for g in result.rule_gaps]
+        if tracer is not None:
+            tracer.flush()
+            _refresh_sao_status(tracer)
+
+    for i, dr in enumerate(st.session_state.get("drafted_rules", [])):
+        with st.container(border=True):
+            st.markdown(f"**Proposed rule:** `{dr['filename']}` (detects {dr['vuln_class']})")
+            st.code(dr["markdown"], language="markdown")
+            col1, col2 = st.columns(2)
+            pushed = dr["filename"] in st.session_state.get("pushed_rules", set())
+            if col1.button("✓ Push to live corpus" if not pushed else "✓ Pushed",
+                          key=f"push_{i}", disabled=pushed):
+                push_rule(dr)
+                st.session_state.setdefault("pushed_rules", set()).add(dr["filename"])
+                st.success(f"Pushed. Re-run the scan and {dr['vuln_class']} will be caught.")
+            col2.download_button("⬇ Download .md rule", data=dr["markdown"],
+                                 file_name=dr["filename"], mime="text/markdown",
+                                 key=f"dlrule_{i}")
+
+
+def _render_patches(result):
+    st.divider()
+    st.markdown("### Suggested patches for confirmed findings")
+    if st.button("Generate suggested patches", key="gen_patches"):
+        tracer = st.session_state.get("sao_tracer")
+        llm, budget = _build_llm()
+        st.session_state["patches"] = suggest_patches(result.true_positives, llm, budget, tracer)
+        if tracer is not None:
+            tracer.flush()
+            _refresh_sao_status(tracer)
+
+    for pt in st.session_state.get("patches", []):
+        with st.container(border=True):
+            st.markdown(f"**{pt['vuln_class']}** in `{pt['symbol']}()` — `{pt['file']}`")
+            cbefore, cafter = st.columns(2)
+            with cbefore:
+                st.markdown("**Vulnerable**")
+                st.code(pt["before"], language="python")
+            with cafter:
+                st.markdown("**Patched**")
+                st.code(pt["after"], language="python")
+            st.markdown(f"**Why this fixes it:** {pt['why']}")
+
+
+def _render_sao_status():
+    if not st.session_state.get("sao_requested"):
+        return
+    project_url, agent_stream_url = st.session_state.get("sao_urls", (None, None))
+    warnings = st.session_state.get("sao_warnings") or []
+
+    if st.session_state.get("sao_activated") and agent_stream_url:
+        st.markdown(f"🔭 [View this run in Splunk Agent Observability →]({agent_stream_url})")
+    else:
+        st.warning("SAO tracing was requested but did not activate for this run. "
+                  "Check the terminal (or your host's log viewer) for a line "
+                  "starting with `SAO tracing unavailable` or `SAO API key is set "
+                  "but the splunk-ao package isn't installed`.")
+
+    if warnings:
+        st.warning(f"SAO's own SDK logged {len(warnings)} warning(s) instead of "
+                  f"raising while sending this run's traces.")
+        with st.expander("SAO SDK warnings for this run"):
+            for w in warnings:
+                st.code(w, language=None)
+
+    session_id = st.session_state.get("sao_session_id")
+    pending = st.session_state.get("sao_pending_before_flush")
+    if session_id is not None:
+        with st.expander("SAO diagnostic detail"):
+            st.markdown(f"**Session id:** `{session_id}` — open this exact session "
+                       f"in the console to see its traces nested inside.")
+            if pending is not None:
+                if pending > 0:
+                    st.markdown(f"**{pending} trace(s) were built locally** before "
+                               f"the last flush.")
+                else:
+                    st.markdown("**0 traces were built locally** before the last flush.")
+
+
+def _render_history():
+    st.markdown("#### 🕘 Run history")
+    hist = st.session_state.get("history", [])
+    if not hist:
+        st.caption("No runs yet — results appear here after you scan.")
+        return
+    for i, h in enumerate(hist):
+        label = "Latest" if i == 0 else "Previous"
+        with st.container(border=True):
+            st.markdown(f"**{label}** · {h['time']}")
+            st.caption(h["source"])
+            if h["raw"]:
+                extra = f" · ⚠️{h['raw']['unverifiable']} unverifiable" if h["raw"]["unverifiable"] else ""
+                st.markdown(f"🟠 Raw: **{h['raw']['reported']}** found{extra}")
+            if h["harness"]:
+                hh = h["harness"]
+                st.markdown(f"🔵 Harness: **{hh['tps']}** confirmed  \n"
+                            f"{hh['demoted']} demoted · {hh['gaps']} gaps  \n"
+                            f"cov {hh['coverage']} · ${hh['spend']}")
+
+
+@st.fragment
+def render_results_area():
+    baseline = st.session_state.get("baseline")
+    result = st.session_state.get("result")
+    if baseline is None and result is None and not st.session_state.get("history"):
+        return
+
+    main_col, hist_col = st.columns([4, 1])
+    with main_col:
+        st.divider()
+        _render_sao_status()
+        if baseline is not None and result is not None:
+            _render_comparison_table(baseline, result)
+        if baseline is not None:
+            _render_raw_detail(baseline)
+        if result is not None:
+            _render_harness_detail(result)
+            _render_flywheel(result)
+            _render_patches(result)
+        with st.expander("What this prototype honors vs. defers (be honest in the demo)"):
+            st.markdown("""
+**Honored:** Evidence Over Assertion (I); Surface Only What Survives (II);
+Fingerprints Stable Under Edit (VIII); Coverage Before Yield (VI); Exploited
+Means Demonstrated (VII).
+
+**Deferred:** heartbeat liveness (III), atomic mortal claims (IV),
+provider-as-rate-arbiter (V), infrastructure sandbox (IX) — need a real
+fleet + runtime isolation. This build also never executes fetched or pasted
+code — no live testbed means PoCs stay sketches, by design.
+
+**Unverified, not assumed:** whether LangGraph's per-node chain calls
+propagate this run's SAO callback config far enough to produce correctly
+nested, correctly named spans under one trace, or whether every role's span
+flattens/dedupes unexpectedly. Check the actual trace tree the first time
+this runs live with a real key.
+            """)
+    with hist_col:
+        _render_history()
+
+
+render_results_area()

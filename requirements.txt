@@ -1,0 +1,7 @@
+streamlit>=1.40
+requests>=2.31
+langchain-core>=0.3
+langchain-anthropic>=0.3
+langchain-openai>=0.2
+langgraph>=0.2
+splunk-ao>=0.4
