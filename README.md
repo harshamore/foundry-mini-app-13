@@ -74,29 +74,37 @@ LangChain idioms). The hard-won lesson about the SDK's own swallow-and-warn
 behavior is carried over rather than rediscovered: `_WarningCollector` still
 attaches to the `"splunk_ao"` logger and surfaces what it catches in the UI.
 
-**The hierarchy this produces is richer than app-12's, for free**, from
-LangChain's own callback propagation: one session per "Run" click (as
-before), but now **one trace per graph invocation** — the whole harness
-pipeline is "one complete interaction," matching SAO's own definition of a
-trace — with each role's chain call showing up as a **nested named span**
-inside that trace via its `run_name`/`tags`. app-12's flatter "one trace per
-role" design was a simplification forced by having no natural nesting
-mechanism in a raw-SDK build; this should be the more faithful mapping.
+**Correction, found by direct testing rather than assumed**: the plan going
+in was "one trace per graph invocation, each role as a nested span inside
+it" — richer than app-12's flat design, "for free" from LangChain's callback
+propagation. That's not what actually happens. `llm.py`'s `invoke_structured()`
+— the function every role's LLM call goes through — builds its own fresh
+`config` at the point of each call (`run_name`/`tags` naming that role) and
+attaches the same `SplunkAOCallback` instance there directly; LangGraph nodes
+are plain Python functions, not `Runnable`s, so they never receive or nest
+under the top-level `graph.stream()` call's config in the first place —
+`tracer` reaches each node purely via closure. Combined with
+`SplunkAOCallback` defaulting to `start_new_trace=True`, reusing the same
+callback instance across independent calls produces **one trace per
+individual chain invocation** — e.g. several separate `"triager"`-named
+traces (one per candidate the role loops over), not one combined trace per
+role, and the top-level `"full-pipeline"` attachment in `pipeline.py`
+doesn't parent anything. Confirmed by constructing a real `SplunkAOLogger`
+in `ingestion_hook` mode (bypasses the network entirely while still
+exercising the real callback → commit → flush pipeline) and inspecting the
+captured payload directly.
 
-**Unverified, flagged plainly rather than assumed**: whether LangGraph
-node-internal chain invocations actually propagate the top-level `config`'s
-callbacks/tags far enough down to produce correctly-nested, correctly-named
-spans, or whether every role's contribution flattens into one
-undifferentiated trace. `SplunkAOCallback` is used here rather than
-`SplunkAOMiddleware` specifically because the SDK's own docs only demonstrate
-the middleware attached to `create_agent(...)` (a prebuilt ReAct-style
-agent) — not a hand-rolled `StateGraph` — while the callback attached via
-`config=` is the same mechanism already proven to work for Galileo tracing
-in the sibling DeepAgents-based harness. **Check the actual trace tree the
-first time this runs live with a real key.** If nesting doesn't come
-through, the documented fallback is invoking each node's chain as its own
-top-level call (one trace per role, matching app-12's flatter shape exactly)
-instead of one `graph.stream()` for the whole run.
+That same investigation also explains a bug this build shipped with and then
+fixed: **`SplunkAOLogger.traces` is never populated by the callback-based
+path** — a full offline round trip (a real, well-formed trace captured via
+`ingestion_hook`, successfully flushed) still left `logger.traces == []`
+throughout. `observability.py`'s activation check originally used
+`len(logger.traces)`, ported directly from app-12's manual-span design where
+that field *is* the right signal — here it always read zero, so the UI
+reported "SAO tracing did not activate" even on runs where it demonstrably
+had. Fixed by wrapping `SplunkAOCallback` in a subclass that counts
+`on_chain_end` completions instead, confirmed empirically to be the correct
+signal for this path.
 
 Three GUI fields, all optional (Observability expander in the sidebar): a
 **SAO API key**, a **SAO project name** (default `foundry-mini`), and a

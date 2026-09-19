@@ -303,7 +303,7 @@ def _refresh_sao_status(tracer):
     st.session_state["sao_urls"] = tracer.console_urls()
     st.session_state["sao_warnings"] = tracer.sdk_warnings
     st.session_state["sao_session_id"] = tracer.session_id
-    st.session_state["sao_pending_before_flush"] = tracer.pending_before_flush
+    st.session_state["sao_completed_count"] = tracer.completed_count
 
 
 def _record_history():
@@ -334,7 +334,7 @@ def _record_history():
 if run and sources:
     for k in ("result", "result_md", "baseline", "drafted_rules", "patches",
              "pushed_rules", "sao_urls", "sao_requested", "sao_activated",
-             "sao_warnings", "sao_session_id", "sao_pending_before_flush"):
+             "sao_warnings", "sao_session_id", "sao_completed_count"):
         st.session_state.pop(k, None)
 
     old_tracer = st.session_state.pop("sao_tracer", None)
@@ -548,17 +548,26 @@ def _render_sao_status():
                 st.code(w, language=None)
 
     session_id = st.session_state.get("sao_session_id")
-    pending = st.session_state.get("sao_pending_before_flush")
+    completed = st.session_state.get("sao_completed_count")
     if session_id is not None:
         with st.expander("SAO diagnostic detail"):
             st.markdown(f"**Session id:** `{session_id}` — open this exact session "
                        f"in the console to see its traces nested inside.")
-            if pending is not None:
-                if pending > 0:
-                    st.markdown(f"**{pending} trace(s) were built locally** before "
-                               f"the last flush.")
+            if completed is not None:
+                if completed > 0:
+                    st.markdown(f"**{completed} internal step(s) completed and were "
+                               f"staged for sending** (counts every chain-classified "
+                               f"step, including prompt formatting — not 1:1 with "
+                               f"LLM calls). If they still don't show up in the "
+                               f"console, the run genuinely reached SAO's callback "
+                               f"layer — check the SDK warnings above, or that "
+                               f"you're looking inside the right session "
+                               f"(`{session_id}`) rather than a sessions *list* view.")
                 else:
-                    st.markdown("**0 traces were built locally** before the last flush.")
+                    st.markdown("**0 chain calls completed** — tracing attached but "
+                               "no LLM call finished while it was active (an error "
+                               "earlier in the run likely stopped things first; "
+                               "check for an error message above).")
 
 
 def _render_history():
