@@ -107,10 +107,18 @@ def stream_harness(sources: dict, llm, budget, tracer=None):
         "corpus": [], "demotions": [], "rule_gaps": [],
     }
     graph = build_graph(llm, budget, tracer, load_corpus)
+    # No tracer.callback attached here on purpose: each role now brackets its
+    # own trace directly (start_role_trace()/end_role_trace(), called from
+    # inside the node functions) rather than relying on this outer
+    # graph.stream() invocation to parent anything. Attaching the same
+    # callback here too was a leftover from an earlier, abandoned design
+    # ("one trace for the whole graph run") and conflicted with the per-role
+    # brackets -- the graph call would register itself as the callback's
+    # own root and swallow every nested per-role call into it instead of
+    # letting each one attach to its own role's trace, which is why every
+    # role except `baseline` (the one thing that runs outside this graph
+    # entirely) stopped showing up.
     config = {"recursion_limit": 25}
-    if tracer is not None:
-        config["callbacks"] = [tracer.callback]
-        config["run_name"] = "full-pipeline"
 
     for chunk in graph.stream(state, config=config):
         for stage_name, update in chunk.items():
