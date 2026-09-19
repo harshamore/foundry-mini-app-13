@@ -73,17 +73,23 @@ def _mock_patch(finding):
 def suggest_patches(true_positives, llm, budget, tracer=None) -> list:
     patches = []
     model_name = getattr(llm, "model", getattr(llm, "model_name", "")) if llm else ""
-    for f in true_positives:
-        user_input = (f"Vulnerability: {f.vuln_class} in function {f.symbol} "
-                     f"(file {f.file}).\nContext: {f.investigation}\nProvide the fix.")
-        out: PatchOutput = invoke_structured(
-            PATCH_PROMPT, llm, "remediator", {"user_input": user_input}, PatchOutput, model_name,
-            budget, mock_fn=_mock_patch(f), tracer=tracer)
-        canon = _CANONICAL.get(f.vuln_class, {})
-        patches.append({
-            "symbol": f.symbol, "file": f.file, "vuln_class": f.vuln_class,
-            "before": out.before or canon.get("before", ""),
-            "after": out.after or canon.get("after", ""),
-            "why": out.why or canon.get("why", ""),
-        })
+    if tracer is not None:
+        tracer.start_role_trace("remediator", f"{len(true_positives)} confirmed finding(s)")
+    try:
+        for f in true_positives:
+            user_input = (f"Vulnerability: {f.vuln_class} in function {f.symbol} "
+                         f"(file {f.file}).\nContext: {f.investigation}\nProvide the fix.")
+            out: PatchOutput = invoke_structured(
+                PATCH_PROMPT, llm, "remediator", {"user_input": user_input}, PatchOutput, model_name,
+                budget, mock_fn=_mock_patch(f), tracer=tracer)
+            canon = _CANONICAL.get(f.vuln_class, {})
+            patches.append({
+                "symbol": f.symbol, "file": f.file, "vuln_class": f.vuln_class,
+                "before": out.before or canon.get("before", ""),
+                "after": out.after or canon.get("after", ""),
+                "why": out.why or canon.get("why", ""),
+            })
+    finally:
+        if tracer is not None:
+            tracer.end_role_trace()
     return patches

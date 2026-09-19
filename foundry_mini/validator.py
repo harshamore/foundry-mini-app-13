@@ -53,9 +53,15 @@ def build_validator_node(llm, budget, tracer):
     def validator_node(state: dict) -> dict:
         from .finding import Verdict
         tps = state["store"].with_verdict(Verdict.TRUE_POSITIVE)
-        for f in tps:
-            f.poc = poc_sketch(f, llm, budget, tracer)
-            f.exploited = False   # Principle VII: no testbed -> no execution claim
+        if tracer is not None:
+            tracer.start_role_trace("validator", f"{len(tps)} confirmed finding(s)")
+        try:
+            for f in tps:
+                f.poc = poc_sketch(f, llm, budget, tracer)
+                f.exploited = False   # Principle VII: no testbed -> no execution claim
+        finally:
+            if tracer is not None:
+                tracer.end_role_trace()
         return {}
 
     return validator_node

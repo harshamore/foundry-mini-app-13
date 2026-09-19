@@ -151,22 +151,27 @@ def _investigate(finding, index, security_map, llm, budget, tracer):
 
 def triage_all(store, index, sources, coverage, security_map, llm, budget, tracer=None):
     demotions = []
-    for f in store.all():
-        if f.verdict is not None:
-            continue
-        cites, narrative = _investigate(f, index, security_map, llm, budget, tracer)
-        f.citations = cites
-        ok, why = evidence_gate(f, sources)
-        f.investigation = (narrative or "(model returned no narrative)") + f"  [gate: {why}]"
-        coverage.record_attempt(f"triage:{f.vuln_class}", "llm-investigation")
+    candidates = [f for f in store.all() if f.verdict is None]
+    if tracer is not None:
+        tracer.start_role_trace("triager", f"{len(candidates)} candidate(s)")
+    try:
+        for f in candidates:
+            cites, narrative = _investigate(f, index, security_map, llm, budget, tracer)
+            f.citations = cites
+            ok, why = evidence_gate(f, sources)
+            f.investigation = (narrative or "(model returned no narrative)") + f"  [gate: {why}]"
+            coverage.record_attempt(f"triage:{f.vuln_class}", "llm-investigation")
 
-        if ok:
-            f.verdict = Verdict.TRUE_POSITIVE
-            f.state = State.CONFIRMED
-        else:
-            f.verdict = Verdict.NEEDS_REVIEW
-            f.state = State.VERDICT_ASSIGNED
-            demotions.append((f.symbol, f.vuln_class, why))
+            if ok:
+                f.verdict = Verdict.TRUE_POSITIVE
+                f.state = State.CONFIRMED
+            else:
+                f.verdict = Verdict.NEEDS_REVIEW
+                f.state = State.VERDICT_ASSIGNED
+                demotions.append((f.symbol, f.vuln_class, why))
+    finally:
+        if tracer is not None:
+            tracer.end_role_trace(f"{len(demotions)} demoted")
     return demotions
 
 

@@ -1,51 +1,49 @@
 """
 Optional Splunk Agent Observability (SAO) tracing — LangChain edition.
 
-app-12 wired SAO by hand (manual SplunkAOLogger.start_trace()/add_llm_span()/
-conclude()/flush() calls) because it had no framework underneath to hook
-into. Here every role's real call IS a LangChain Runnable, so SAO attaches
-through LangChain's own native integration instead: one SplunkAOCallback,
-built once per "Run" click, passed via config={"callbacks": [...]} on every
-chain.invoke() (llm.py's invoke_structured() is the one place it's wired).
+Target hierarchy, **verified empirically, not assumed** (constructed a real
+`SplunkAOLogger` in `ingestion_hook` mode — bypasses the network entirely
+while still exercising the real callback/commit/flush pipeline — and
+inspected the captured payload directly): one **session** per "Run" click,
+one **trace per role** (`cartographer`, `detector`, `triager`, `validator`,
+`reporter`, `baseline`, `rule_authoring`, `remediator`), with every call that
+role makes internally (each function checked, each candidate triaged, each
+finding patched) showing up as its own **span nested inside that one trace**.
 
-Still strictly opt-in and fails soft, same as app-12: build_sao_tracer()
-returns None whenever no API key is supplied — no import of `splunk_ao` is
-even attempted — and any failure once a key IS set is caught and reported,
-never raised.
+Getting this shape took two corrections along the way, both found by testing
+rather than reading docs and assuming:
 
-Hard-won lesson ported from app-12, not rediscovered: the splunk-ao SDK's
-own trace/span-emitting calls catch their own failures internally and log
-via Python's `logging` module instead of raising. SplunkAOCallback almost
-certainly goes through the same internals to emit its spans, so the same
-_WarningCollector(logging.Handler) pattern — attach to the "splunk_ao"
-logger, surface captured warnings in the UI — is carried over rather than
-re-learned the hard way.
+1. Naively attaching `SplunkAOCallback` per-call with its default
+   `start_new_trace=True` does NOT produce "one trace per role" — it
+   produces one trace per individual chain invocation (confirmed: several
+   separate same-named traces, one per loop iteration, not one trace holding
+   several spans). Fixed by constructing the callback with
+   `start_new_trace=False` and having each role explicitly bracket its own
+   work with `logger.start_trace(name=role)` / `logger.conclude()`
+   (`start_role_trace()`/`end_role_trace()` below) — every `invoke_structured()`
+   call made while that bracket is open then attaches as a span under the
+   caller-owned trace instead of starting its own. Verified directly: one
+   `start_trace(name="detector")` followed by three `chain.invoke()` calls
+   with different `run_name`s produced exactly one `detector` trace with
+   three top-level spans, each named after its own call, each with its own
+   nested prompt/LLM sub-spans.
 
-Target hierarchy: each role's own `invoke_structured()` call independently
-attaches this callback with its own `run_name`/`tags` (confirmed by reading
-`llm.py` — it builds a fresh config at every call site rather than relying on
-propagation from a parent invocation), and `SplunkAOCallback` defaults to
-`start_new_trace=True`, so in practice this produces one trace per
-individual chain call — e.g. several separate `"triager"`-named traces, one
-per candidate, not one combined trace for the whole role. Confirmed by
-constructing a real `SplunkAOLogger` in `ingestion_hook` mode (bypasses the
-network entirely, still exercises the real callback/commit/flush pipeline)
-and inspecting the captured payload: a single `chain.invoke()` under this
-config produces one well-formed, correctly-named, correctly-nested trace
-(prompt-template span + LLM span) exactly as expected.
+2. `SplunkAOLogger.traces` is never populated by the callback-based path —
+   confirmed empirically: a full offline round trip (a real, well-formed
+   trace captured via `ingestion_hook`, successfully flushed) still left
+   `logger.traces == []` throughout. That field is populated only by the
+   *manual* `start_trace()`/`add_trace()` API's own bookkeeping in other
+   contexts, not by what the callback stages internally. `SAOTracer.
+   activated` tracks a `_TrackingCallback` subclass's `on_chain_end`
+   completions instead, confirmed the correct signal by the same test.
 
-That same investigation surfaced the real bug behind "SAO tracing was
-requested but did not activate" even when tracing demonstrably worked:
-**`SplunkAOLogger.traces` is never populated by the callback-based path** —
-confirmed empirically, not assumed: a full offline round trip (real trace
-captured via `ingestion_hook`, successfully flushed) still left
-`logger.traces == []` throughout. `logger.traces` is populated only by the
-*manual* `start_trace()`/`add_trace()` API (what app-12's raw-SDK build and
-Splunk's own sample scripts use) — the callback path builds and stages spans
-through an entirely separate internal mechanism. `SAOTracer.activated` below
-tracks activation via a `_TrackingCallback` subclass's `on_chain_end`
-override instead, which the same investigation confirmed fires exactly when
-an invocation completes and is staged for sending.
+Still strictly opt-in and fails soft: `build_sao_tracer()` returns `None`
+whenever no API key is supplied — no import of `splunk_ao` is even
+attempted — and any failure once a key IS set is caught and reported, never
+raised. The SDK's own trace/span-emitting calls also catch their own
+failures internally and log via Python's `logging` module instead of
+raising — `_WarningCollector` attaches to the `"splunk_ao"` logger so the UI
+can surface those instead of them vanishing silently.
 """
 
 from __future__ import annotations
@@ -93,9 +91,12 @@ class SAOTracer:
     """One of these per SAO session — built for the main "Run" click, then
     reused (via st.session_state) by the two later follow-on actions too, so
     every real LLM call in a session gets traced, not just the main run.
-    Wraps a tracking SplunkAOCallback; LangChain attaches it via config= at
-    each chain.invoke() (llm.py), so this class's own job is bookkeeping
-    (warnings, console urls, diagnostic counts), not manual span emission."""
+
+    `callback` is constructed with `start_new_trace=False`: it never starts
+    a trace on its own. Each role is responsible for bracketing its own work
+    with `start_role_trace(role)` / `end_role_trace()` so its calls attach as
+    spans under one trace named after that role, instead of each call
+    starting its own independent trace."""
 
     def __init__(self, callback: Any, logger: Any, console_url: str):
         self.callback = callback
@@ -121,6 +122,28 @@ class SAOTracer:
     @property
     def activated(self) -> bool:
         return self.completed_count > 0
+
+    def start_role_trace(self, role: str, input_summary: str = "") -> None:
+        """Open one trace for `role`. Every invoke_structured() call made
+        before the matching end_role_trace() attaches as a span inside it,
+        rather than starting its own trace (callback is start_new_trace=
+        False) — this is what turns "one trace per call" into "one trace
+        per role, calls as spans within it"."""
+        try:
+            self._logger.start_trace(name=role, input=input_summary or f"{role} stage")
+        except Exception as e:  # noqa: BLE001 -- must not break a run
+            print(f"SAO start_role_trace({role!r}) failed ({type(e).__name__}: {e}) "
+                 f"-- continuing without it.")
+
+    def end_role_trace(self, output_summary: str | None = None) -> None:
+        """Close the trace opened by start_role_trace(). Always call this
+        even on an error path (use try/finally) — an unconcluded trace left
+        open would otherwise capture unrelated later spans as its children."""
+        try:
+            self._logger.conclude(output=output_summary)
+        except Exception as e:  # noqa: BLE001 -- must not break a run
+            print(f"SAO end_role_trace failed ({type(e).__name__}: {e}) "
+                 f"-- continuing without it.")
 
     def console_urls(self) -> tuple[str | None, str | None]:
         try:
@@ -174,7 +197,8 @@ def build_sao_tracer(api_key: str | None, project: str | None,
                                agent_stream=agent_stream or DEFAULT_AGENT_STREAM)
         logger = splunk_ao_context.get_logger_instance()
         logger.start_session()
-        callback = _make_tracking_callback(SplunkAOCallback)(splunk_ao_logger=logger)
+        callback = _make_tracking_callback(SplunkAOCallback)(
+            splunk_ao_logger=logger, start_new_trace=False)
         console_url = SplunkAOConfig.get().console_url or DEFAULT_CONSOLE_URL
         return SAOTracer(callback, logger, console_url)
     except Exception as e:  # noqa: BLE001 -- init/network failure must not break a run

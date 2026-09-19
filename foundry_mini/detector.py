@@ -182,9 +182,21 @@ def build_detector_node(llm, budget, tracer, load_corpus_fn):
             coverage.ensure(f"triage:{r.vuln_class}")
         coverage.ensure("triage:CWE-798")
 
-        rule_sweep(index, corpus, llm, budget, store, tracer)
+        # One "detector" trace covers both LLM-calling activities (rule
+        # sweep + exploratory hunt) -- every function/candidate checked
+        # attaches as its own span inside it, not as a separate trace.
+        # secret_scan is deterministic (no LLM), so it runs outside the
+        # bracket -- there's nothing for it to trace.
         secret_scan(index, store)
-        _, gaps = exploratory_hunt(index, llm, budget, store, coverage, corpus, tracer)
+        if tracer is not None:
+            tracer.start_role_trace("detector", f"{len(index.list_functions())} functions, "
+                                                f"{len(corpus)} rules")
+        try:
+            rule_sweep(index, corpus, llm, budget, store, tracer)
+            _, gaps = exploratory_hunt(index, llm, budget, store, coverage, corpus, tracer)
+        finally:
+            if tracer is not None:
+                tracer.end_role_trace()
         coverage.record_attempt("triage:CWE-798", "secret-scan")
 
         return {"corpus": corpus, "rule_gaps": gaps}

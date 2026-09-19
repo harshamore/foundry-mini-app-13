@@ -80,9 +80,15 @@ def run_baseline(sources, llm, budget, tracer=None):
     corpus_text = "\n\n".join(f"### FILE: {name}\n{src}" for name, src in sources.items())
     user_input = f"Here is the full source:\n\n{corpus_text}"
     model_name = getattr(llm, "model", getattr(llm, "model_name", "")) if llm else ""
-    out: BaselineOutput = invoke_structured(
-        BASELINE_PROMPT, llm, "baseline", {"user_input": user_input}, BaselineOutput, model_name,
-        budget, mock_fn=_mock_baseline(sources), tracer=tracer)
+    if tracer is not None:
+        tracer.start_role_trace("baseline", f"{len(sources)} file(s)")
+    try:
+        out: BaselineOutput = invoke_structured(
+            BASELINE_PROMPT, llm, "baseline", {"user_input": user_input}, BaselineOutput, model_name,
+            budget, mock_fn=_mock_baseline(sources), tracer=tracer)
+    finally:
+        if tracer is not None:
+            tracer.end_role_trace()
 
     findings = [f.model_dump() for f in out.findings]
     for f in findings:

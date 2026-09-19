@@ -85,13 +85,19 @@ def classify(vuln_class: str, note: str, llm=None, budget=None, tracer=None) -> 
 def build_reporter_node(llm, budget, tracer):
     def reporter_node(state: dict) -> dict:
         tps = state["store"].with_verdict(Verdict.TRUE_POSITIVE)
-        for f in tps:
-            classified = classify(f.vuln_class, f.description, llm, budget, tracer)
-            f.severity = classified["severity"]
-            f.title = classified["title"]
-            f.business_impact = classified["business_impact"]
-            f.weakness = f.vuln_class
-            f.state = State.PUBLISHED
+        if tracer is not None:
+            tracer.start_role_trace("reporter", f"{len(tps)} confirmed finding(s)")
+        try:
+            for f in tps:
+                classified = classify(f.vuln_class, f.description, llm, budget, tracer)
+                f.severity = classified["severity"]
+                f.title = classified["title"]
+                f.business_impact = classified["business_impact"]
+                f.weakness = f.vuln_class
+                f.state = State.PUBLISHED
+        finally:
+            if tracer is not None:
+                tracer.end_role_trace()
         return {}
 
     return reporter_node

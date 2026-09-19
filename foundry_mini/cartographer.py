@@ -131,11 +131,16 @@ def build_security_map(index, llm, budget, tracer=None) -> dict:
     if llm is None:
         heuristic["llm_augmented"] = False
         return heuristic
+    if tracer is not None:
+        tracer.start_role_trace("cartographer", f"{len(index.list_functions())} functions")
     try:
         llm_map = _llm_map(index, llm, budget, tracer)
     except ModelError:
         heuristic["llm_augmented"] = False
         return heuristic
+    finally:
+        if tracer is not None:
+            tracer.end_role_trace()
     return _merge(heuristic, llm_map)
 
 

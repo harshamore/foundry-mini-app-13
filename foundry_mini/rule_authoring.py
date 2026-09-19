@@ -89,14 +89,21 @@ def _signal_for(cls: str, gap: dict, llm, budget, tracer) -> str:
 def draft_rule_from_gap(gap: dict, llm, budget, tracer=None) -> dict:
     cls = gap["vuln_class"]
     name = _CLASS_NAME.get(cls, cls.lower())
-    signal = _signal_for(cls, gap, llm, budget, tracer)
 
-    model_name = getattr(llm, "model", getattr(llm, "model_name", "")) if llm else ""
-    drafted: RuleGuidance = invoke_structured(
-        GUIDANCE_PROMPT, llm, "rule_authoring",
-        {"user_input": f"Vulnerability class: {cls}\nObserved pattern: {gap['pattern']}\n"
-                      f"Write a short prevention rule for developers."},
-        RuleGuidance, model_name, budget, mock_fn=_mock_guidance(gap), tracer=tracer)
+    if tracer is not None:
+        tracer.start_role_trace("rule_authoring", f"gap: {cls}")
+    try:
+        signal = _signal_for(cls, gap, llm, budget, tracer)
+
+        model_name = getattr(llm, "model", getattr(llm, "model_name", "")) if llm else ""
+        drafted: RuleGuidance = invoke_structured(
+            GUIDANCE_PROMPT, llm, "rule_authoring",
+            {"user_input": f"Vulnerability class: {cls}\nObserved pattern: {gap['pattern']}\n"
+                          f"Write a short prevention rule for developers."},
+            RuleGuidance, model_name, budget, mock_fn=_mock_guidance(gap), tracer=tracer)
+    finally:
+        if tracer is not None:
+            tracer.end_role_trace()
 
     filename = f"codeguard-authored-{name}.md"
     markdown = (

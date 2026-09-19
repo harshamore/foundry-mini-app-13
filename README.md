@@ -66,45 +66,52 @@ That whole mechanism was necessary because app-12 had no framework
 underneath to hook into.
 
 Here, every role's real call IS a LangChain `Runnable`, so SAO attaches
-through LangChain's own integration: one `SplunkAOCallback`, built once per
-"Run" click, passed via `config={"callbacks": [...]}` on every
-`chain.invoke()` (`llm.py`'s `invoke_structured()` is the one place it's
-wired — same "single attachment point" principle as app-12, adapted to
-LangChain idioms). The hard-won lesson about the SDK's own swallow-and-warn
-behavior is carried over rather than rediscovered: `_WarningCollector` still
-attaches to the `"splunk_ao"` logger and surfaces what it catches in the UI.
+through LangChain's own integration instead of manual spans. The hard-won
+lesson about the SDK's own swallow-and-warn behavior is carried over rather
+than rediscovered: `_WarningCollector` still attaches to the `"splunk_ao"`
+logger and surfaces what it catches in the UI.
 
-**Correction, found by direct testing rather than assumed**: the plan going
-in was "one trace per graph invocation, each role as a nested span inside
-it" — richer than app-12's flat design, "for free" from LangChain's callback
-propagation. That's not what actually happens. `llm.py`'s `invoke_structured()`
-— the function every role's LLM call goes through — builds its own fresh
-`config` at the point of each call (`run_name`/`tags` naming that role) and
-attaches the same `SplunkAOCallback` instance there directly; LangGraph nodes
-are plain Python functions, not `Runnable`s, so they never receive or nest
-under the top-level `graph.stream()` call's config in the first place —
-`tracer` reaches each node purely via closure. Combined with
-`SplunkAOCallback` defaulting to `start_new_trace=True`, reusing the same
-callback instance across independent calls produces **one trace per
-individual chain invocation** — e.g. several separate `"triager"`-named
-traces (one per candidate the role loops over), not one combined trace per
-role, and the top-level `"full-pipeline"` attachment in `pipeline.py`
-doesn't parent anything. Confirmed by constructing a real `SplunkAOLogger`
-in `ingestion_hook` mode (bypasses the network entirely while still
-exercising the real callback → commit → flush pipeline) and inspecting the
-captured payload directly.
+**Final shape — one trace per role, every call that role makes as a span
+inside it — reached in two corrections, both found by direct testing rather
+than assumed:**
 
-That same investigation also explains a bug this build shipped with and then
-fixed: **`SplunkAOLogger.traces` is never populated by the callback-based
-path** — a full offline round trip (a real, well-formed trace captured via
-`ingestion_hook`, successfully flushed) still left `logger.traces == []`
-throughout. `observability.py`'s activation check originally used
-`len(logger.traces)`, ported directly from app-12's manual-span design where
-that field *is* the right signal — here it always read zero, so the UI
-reported "SAO tracing did not activate" even on runs where it demonstrably
-had. Fixed by wrapping `SplunkAOCallback` in a subclass that counts
-`on_chain_end` completions instead, confirmed empirically to be the correct
-signal for this path.
+1. First attempt: attach one `SplunkAOCallback` (default `start_new_trace=
+   True`) via `config=` at each role's own `chain.invoke()` call
+   (`llm.py`'s `invoke_structured()`). Since LangGraph nodes are plain
+   Python functions, not `Runnable`s, they never inherit a parent
+   invocation's config — each call is independent. Tested via a real
+   `SplunkAOLogger` in `ingestion_hook` mode (bypasses the network entirely
+   while still exercising the real callback → commit → flush pipeline):
+   this produced **one trace per individual chain call**, not one per role
+   — several separate `"triager"`-named traces, one per candidate, rather
+   than one trace holding several spans.
+2. Fixed by constructing the callback with `start_new_trace=False` and
+   having each role explicitly bracket its own work —
+   `tracer.start_role_trace(role)` before its calls,
+   `tracer.end_role_trace()` (in a `finally`) after. Every
+   `invoke_structured()` call made while that bracket is open now attaches
+   as a span under the caller-owned trace instead of starting its own.
+   Verified directly: one `start_role_trace("detector")` around a rule-sweep
+   loop plus an exploratory-hunt call produced exactly one `detector` trace
+   with one top-level span per call made, each with its own nested
+   prompt/LLM sub-spans — the shape actually wanted.
+
+That same `ingestion_hook`-based investigation also explains a bug this
+build shipped with and then fixed: **`SplunkAOLogger.traces` is never
+populated by the callback-based path** — a full offline round trip (a real,
+well-formed trace captured via `ingestion_hook`, successfully flushed) still
+left `logger.traces == []` throughout. `observability.py`'s activation check
+originally used `len(logger.traces)`, ported directly from app-12's
+manual-span design where that field *is* the right signal — here it always
+read zero, so the UI reported "SAO tracing did not activate" even on runs
+where it demonstrably had. Fixed by wrapping `SplunkAOCallback` in a
+subclass that counts `on_chain_end` completions instead, confirmed
+empirically to be the correct signal for this path.
+
+One trace per role in practice: `cartographer`, `detector` (covers both rule
+sweep and exploratory hunt — secret scan is deterministic, no LLM, so it
+runs outside the bracket), `triager`, `validator`, `reporter`, `baseline`,
+`rule_authoring`, `remediator`.
 
 Three GUI fields, all optional (Observability expander in the sidebar): a
 **SAO API key**, a **SAO project name** (default `foundry-mini`), and a
