@@ -39,11 +39,10 @@ def poc_sketch(finding, llm, budget, tracer=None) -> str:
     user_input = (f"Finding: {finding.vuln_class} in {finding.symbol} "
                  f"({finding.file}).\nInvestigation: {finding.investigation}\n"
                  f"Write the PoC sketch.")
-    chain = (VALIDATOR_PROMPT | llm) if llm is not None else None
     model_name = getattr(llm, "model", getattr(llm, "model_name", "")) if llm else ""
     try:
         out: ValidatorOutput = invoke_structured(
-            chain, "validator", {"user_input": user_input}, ValidatorOutput,
+            VALIDATOR_PROMPT, llm, "validator", {"user_input": user_input}, ValidatorOutput,
             model_name, budget, mock_fn=_mock_poc(finding), tracer=tracer)
         return out.poc or "(model returned no PoC narrative)"
     except ModelError:

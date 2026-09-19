@@ -72,13 +72,12 @@ def _mock_patch(finding):
 
 def suggest_patches(true_positives, llm, budget, tracer=None) -> list:
     patches = []
-    chain = (PATCH_PROMPT | llm) if llm is not None else None
     model_name = getattr(llm, "model", getattr(llm, "model_name", "")) if llm else ""
     for f in true_positives:
         user_input = (f"Vulnerability: {f.vuln_class} in function {f.symbol} "
                      f"(file {f.file}).\nContext: {f.investigation}\nProvide the fix.")
         out: PatchOutput = invoke_structured(
-            chain, "remediator", {"user_input": user_input}, PatchOutput, model_name,
+            PATCH_PROMPT, llm, "remediator", {"user_input": user_input}, PatchOutput, model_name,
             budget, mock_fn=_mock_patch(f), tracer=tracer)
         canon = _CANONICAL.get(f.vuln_class, {})
         patches.append({

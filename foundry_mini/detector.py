@@ -85,7 +85,6 @@ def rule_sweep(index, corpus, llm, budget, store, tracer=None) -> int:
         return added
     rules_block = "\n".join(
         f"- {r.id} ({r.vuln_class}): {r.description}" for r in corpus)
-    chain = (RULE_SWEEP_PROMPT | llm) if llm is not None else None
     model_name = getattr(llm, "model", getattr(llm, "model_name", "")) if llm else ""
     for symbol in index.list_functions():
         meta = index.find_symbol(symbol)
@@ -94,7 +93,7 @@ def rule_sweep(index, corpus, llm, budget, store, tracer=None) -> int:
                      f"(callers: {index.get_callers(symbol)}), real line numbers:\n"
                      f"{index.numbered_body(symbol)}")
         out: RuleSweepOutput = invoke_structured(
-            chain, "detector.rule_sweep", {"user_input": user_input},
+            RULE_SWEEP_PROMPT, llm, "detector.rule_sweep", {"user_input": user_input},
             RuleSweepOutput, model_name, budget,
             mock_fn=_mock_rule_sweep(index, symbol, corpus), tracer=tracer)
         for hit in out.fires:
@@ -146,10 +145,9 @@ def exploratory_hunt(index, llm, budget, store, coverage, corpus, tracer=None):
     user_input = "Target functions, real line numbers:\n\n" + "\n\n".join(
         f"### {s} — {index.find_symbol(s)['file']}\n{index.numbered_body(s)}"
         for s in index.list_functions())
-    chain = (EXPLORATORY_PROMPT | llm) if llm is not None else None
     model_name = getattr(llm, "model", getattr(llm, "model_name", "")) if llm else ""
     out: ExploratoryOutput = invoke_structured(
-        chain, "detector.exploratory", {"user_input": user_input},
+        EXPLORATORY_PROMPT, llm, "detector.exploratory", {"user_input": user_input},
         ExploratoryOutput, model_name, budget,
         mock_fn=_mock_exploratory(index), tracer=tracer)
 

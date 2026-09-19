@@ -68,11 +68,10 @@ def classify(vuln_class: str, note: str, llm=None, budget=None, tracer=None) -> 
     result = {"title": vuln_class or "Unclassified", "severity": "medium",
              "business_impact": "Potential security impact; requires review."}
     if llm is not None and budget is not None:
-        chain = CLASSIFY_PROMPT | llm
         model_name = getattr(llm, "model", getattr(llm, "model_name", ""))
         try:
             out: ReporterOutput = invoke_structured(
-                chain, "reporter", {"user_input": f"Class: {vuln_class}\nNote: {note}"},
+                CLASSIFY_PROMPT, llm, "reporter", {"user_input": f"Class: {vuln_class}\nNote: {note}"},
                 ReporterOutput, model_name, budget,
                 mock_fn=_mock_classify(vuln_class, note), tracer=tracer)
             result = {"title": out.title or result["title"],

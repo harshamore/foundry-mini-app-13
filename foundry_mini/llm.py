@@ -91,21 +91,32 @@ def build_chat_model(provider: str, api_key: str | None, model_name: str | None)
         raise ModelError(f"could not initialize {provider} client: {e}")
 
 
-def invoke_structured(chain, role: str, inputs: dict, schema, model_name: str,
+def invoke_structured(prompt, llm, role: str, inputs: dict, schema, model_name: str,
                       budget: Budget, mock_fn=None, tracer=None):
     """
     The one seam every node/chain calls through.
 
-    `chain` is `prompt | model` (no `.with_structured_output()` baked in --
-    that's applied here via `.with_structured_output(schema, include_raw=
-    True)` right before invoking, so callers just build a plain prompt|model
-    chain and hand over the schema separately).
+    Takes `prompt` and `llm` SEPARATELY, not a pre-built `prompt | llm`
+    chain — `.with_structured_output()` is a `BaseChatModel` method, not
+    part of the generic `Runnable` interface, so it must be applied to
+    `llm` directly (`llm.with_structured_output(schema, include_raw=True)`)
+    *before* piping into the prompt. Piping first and calling
+    `.with_structured_output()` on the resulting `RunnableSequence` raises
+    `AttributeError: 'RunnableSequence' object has no attribute
+    'with_structured_output'` — confirmed live and against the installed
+    langchain-core source, not assumed. `include_raw=True` matters
+    separately: the plain form only returns the parsed object and discards
+    the AIMessage carrying `usage_metadata` (token counts) that
+    Budget.charge() needs. Confirmed against langchain-core 1.6.3's own
+    with_structured_output() docstring: "The final output is always a
+    dict with keys 'raw', 'parsed', and 'parsing_error'" for both
+    ChatAnthropic and ChatOpenAI.
 
     Returns a parsed instance of `schema`. Raises ModelError (naming `role`)
     on a live call failure or an unparseable reply, mirroring app-12's
     ask_json() -- a parse failure must be loud, not a silent empty result.
     """
-    if chain is None:
+    if llm is None:
         # mock / offline: no LangChain model touched at all. mock_fn takes
         # no arguments by convention -- callers build it as a closure over
         # whatever context it needs (index, symbol, corpus, ...), the same
@@ -119,13 +130,14 @@ def invoke_structured(chain, role: str, inputs: dict, schema, model_name: str,
         budget.charge(in_tok, out_tok, "mock", estimated=True)
         return answer
 
-    structured = chain.with_structured_output(schema, include_raw=True)
+    structured_llm = llm.with_structured_output(schema, include_raw=True)
+    chain = prompt | structured_llm
     config = {"run_name": role, "tags": [role], "metadata": {"role": role}}
     if tracer is not None:
         config["callbacks"] = [tracer.callback]
 
     try:
-        result = structured.invoke(inputs, config=config)
+        result = chain.invoke(inputs, config=config)
     except Exception as e:
         raise ModelError(f"{role}: live call failed: {e}")
 

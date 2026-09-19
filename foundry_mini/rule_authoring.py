@@ -71,11 +71,10 @@ def _mock_guidance(gap):
 def _signal_for(cls: str, gap: dict, llm, budget, tracer) -> str:
     if cls in _SIGNAL_FOR:
         return _SIGNAL_FOR[cls]
-    chain = (SIGNAL_PROMPT | llm) if llm is not None else None
     model_name = getattr(llm, "model", getattr(llm, "model_name", "")) if llm else ""
     try:
         out: RuleSignal = invoke_structured(
-            chain, "rule_authoring.signal",
+            SIGNAL_PROMPT, llm, "rule_authoring.signal",
             {"user_input": f"Vulnerability class: {cls}\nObserved pattern: {gap.get('pattern','')}"},
             RuleSignal, model_name, budget, mock_fn=lambda: RuleSignal(signal=""),
             tracer=tracer)
@@ -92,10 +91,9 @@ def draft_rule_from_gap(gap: dict, llm, budget, tracer=None) -> dict:
     name = _CLASS_NAME.get(cls, cls.lower())
     signal = _signal_for(cls, gap, llm, budget, tracer)
 
-    chain = (GUIDANCE_PROMPT | llm) if llm is not None else None
     model_name = getattr(llm, "model", getattr(llm, "model_name", "")) if llm else ""
     drafted: RuleGuidance = invoke_structured(
-        chain, "rule_authoring",
+        GUIDANCE_PROMPT, llm, "rule_authoring",
         {"user_input": f"Vulnerability class: {cls}\nObserved pattern: {gap['pattern']}\n"
                       f"Write a short prevention rule for developers."},
         RuleGuidance, model_name, budget, mock_fn=_mock_guidance(gap), tracer=tracer)

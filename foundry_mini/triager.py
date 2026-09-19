@@ -138,10 +138,9 @@ def _mock_investigate(index, finding):
 # ------------------------------------------------------------- live agent ---
 def _investigate(finding, index, security_map, llm, budget, tracer):
     user_input = _context_block(index, security_map, finding)
-    chain = (TRIAGE_PROMPT | llm) if llm is not None else None
     model_name = getattr(llm, "model", getattr(llm, "model_name", "")) if llm else ""
     out: TriageOutput = invoke_structured(
-        chain, "triager", {"user_input": user_input}, TriageOutput, model_name,
+        TRIAGE_PROMPT, llm, "triager", {"user_input": user_input}, TriageOutput, model_name,
         budget, mock_fn=_mock_investigate(index, finding), tracer=tracer)
 
     cites = [Citation(c.file or finding.file, finding.symbol, c.line, c.leg, c.note)

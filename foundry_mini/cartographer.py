@@ -89,9 +89,8 @@ def _llm_map(index, llm, budget, tracer) -> dict:
         f"### FILE: {f}\n{index.numbered_file(f)}" for f in index.sources)
     user_input = (f"Functions defined in this target: {index.list_functions()}\n\n"
                  f"{files_block}")
-    chain = CARTOGRAPHER_PROMPT | llm
     out: CartographerOutput = invoke_structured(
-        chain, "cartographer", {"user_input": user_input}, CartographerOutput,
+        CARTOGRAPHER_PROMPT, llm, "cartographer", {"user_input": user_input}, CartographerOutput,
         getattr(llm, "model", getattr(llm, "model_name", "")), budget, tracer=tracer)
 
     entries = [e.model_dump() for e in out.entry_points if _valid_entry(e.model_dump(), index)]

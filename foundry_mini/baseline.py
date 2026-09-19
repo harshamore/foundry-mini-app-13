@@ -79,10 +79,9 @@ def run_baseline(sources, llm, budget, tracer=None):
     filtered."""
     corpus_text = "\n\n".join(f"### FILE: {name}\n{src}" for name, src in sources.items())
     user_input = f"Here is the full source:\n\n{corpus_text}"
-    chain = (BASELINE_PROMPT | llm) if llm is not None else None
     model_name = getattr(llm, "model", getattr(llm, "model_name", "")) if llm else ""
     out: BaselineOutput = invoke_structured(
-        chain, "baseline", {"user_input": user_input}, BaselineOutput, model_name,
+        BASELINE_PROMPT, llm, "baseline", {"user_input": user_input}, BaselineOutput, model_name,
         budget, mock_fn=_mock_baseline(sources), tracer=tracer)
 
     findings = [f.model_dump() for f in out.findings]
